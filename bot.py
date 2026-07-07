@@ -15,7 +15,10 @@ THROTTLING_DELAY = float(os.getenv("THROTTLING_DELAY", 3.0))
 
 bot = Bot(token=os.getenv("TELEGRAM_TOKEN"))
 dp = Dispatcher()
-ai_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+ai_client = genai.Client(
+    api_key=os.getenv("GEMINI_API_KEY"),
+    http_options={
+        'proxy': 'http://38.62.215.106:3128')
 MODEL_NAME = "gemini-2.5-flash"
 
 # --- ХРАНИЛИЩЕ КОНТЕКСТА ---
