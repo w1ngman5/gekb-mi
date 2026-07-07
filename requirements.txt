@@ -1,0 +1,3 @@
+google-genai
+aiogram
+python-dotenv
