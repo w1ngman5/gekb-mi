@@ -1,6 +1,7 @@
 import os
 import asyncio
 import sqlite3
+import google-generativeai
 from typing import Any, Awaitable, Callable, Dict, List
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, BaseMiddleware, types
