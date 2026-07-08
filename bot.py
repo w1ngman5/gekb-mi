@@ -3,7 +3,7 @@ import asyncio
 import aiosqlite
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message
 from openai import AsyncOpenAI
 from dotenv import load_dotenv
 
