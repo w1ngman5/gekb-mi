@@ -1,206 +1,107 @@
 import os
 import asyncio
-import sqlite3
-from typing import Any, Awaitable, Callable, Dict, List
+import aiosqlite
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.filters import Command
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from openai import AsyncOpenAI
 from dotenv import load_dotenv
-from aiogram import Bot, Dispatcher, BaseMiddleware, types
-from aiogram.filters import CommandStart, Command
-from google import genai
-from google.genai import types as genai_types
 
 load_dotenv()
 
-ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
-THROTTLING_DELAY = float(os.getenv("THROTTLING_DELAY", 3.0))
+TOKEN = os.getenv("TELEGRAM_TOKEN")
+OPENAI_KEY = os.getenv("OPENAI_API_KEY")
+ADMIN_ID = int(os.getenv("ADMIN_ID"))
+DB_NAME = "database.db"
 
-bot = Bot(token=os.getenv("TELEGRAM_TOKEN"))
+bot = Bot(token=TOKEN)
 dp = Dispatcher()
-ai_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
-MODEL_NAME = "gemini-2.5-flash"
+client = AsyncOpenAI(api_key=OPENAI_KEY)
 
-# --- ХРАНИЛИЩЕ КОНТЕКСТА ---
-# Словарь, где ключ - user_id, а значение - список объектов Content (история)
-USER_HISTORY: Dict[int, List[genai_types.Content]] = {}
-# Лимит истории (в парах вопрос-ответ). 10 значит, что бот помнит последние 10 реплик.
-# Это защищает оперативную память от переполнения и экономит токены.
-MAX_HISTORY_LEN = 10 
-# ----------------------------
+# --- Инициализация БД ---
+async def init_db():
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("CREATE TABLE IF NOT EXISTS whitelist (user_id INTEGER PRIMARY KEY)")
+        await db.execute("CREATE TABLE IF NOT EXISTS history (user_id INTEGER, role TEXT, content TEXT)")
+        await db.execute("CREATE TABLE IF NOT EXISTS user_settings (user_id INTEGER PRIMARY KEY, model TEXT)")
+        await db.execute("INSERT OR IGNORE INTO whitelist VALUES (?)", (ADMIN_ID,))
+        await db.commit()
 
-DB_FILE = "users.db"
+# --- Вспомогательные функции ---
+async def is_allowed(user_id):
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT 1 FROM whitelist WHERE user_id = ?", (user_id,)) as cursor:
+            return await cursor.fetchone() is not None
 
-def init_db():
-    with sqlite3.connect(DB_FILE) as conn:
-        cursor = conn.cursor()
-        cursor.execute("CREATE TABLE IF NOT EXISTS allowed_users (user_id INTEGER PRIMARY KEY)")
-        if ADMIN_ID != 0:
-            cursor.execute("INSERT OR IGNORE INTO allowed_users (user_id) VALUES (?)", (ADMIN_ID,))
-        conn.commit()
+async def get_model(user_id):
+    async with aiosqlite.connect(DB_NAME) as db:
+        cursor = await db.execute("SELECT model FROM user_settings WHERE user_id = ?", (user_id,))
+        row = await cursor.fetchone()
+        return row[0] if row else "gpt-4o-mini"
 
-def add_user_to_db(user_id: int) -> bool:
-    try:
-        with sqlite3.connect(DB_FILE) as conn:
-            cursor = conn.cursor()
-            cursor.execute("INSERT INTO allowed_users (user_id) VALUES (?)", (user_id,))
-            conn.commit()
-            return True
-    except sqlite3.IntegrityError:
-        return False
+# --- Клавиатура настроек ---
+def get_settings_kb(current_model):
+    buttons = [
+        [InlineKeyboardButton(text="Очистить историю", callback_data="reset")],
+        [
+            InlineKeyboardButton(text="✅ GPT-4o" if current_model == "gpt-4o" else "GPT-4o", callback_data="model_gpt-4o"),
+            InlineKeyboardButton(text="✅ GPT-mini" if current_model == "gpt-4o-mini" else "GPT-mini", callback_data="model_gpt-4o-mini")
+        ]
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
-def remove_user_from_db(user_id: int) -> bool:
-    with sqlite3.connect(DB_FILE) as conn:
-        cursor = conn.cursor()
-        cursor.execute("DELETE FROM allowed_users WHERE user_id = ?", (user_id,))
-        conn.commit()
-        return cursor.rowcount > 0
+# --- Хэндлеры ---
+@dp.message(Command("start"))
+async def cmd_start(message: Message):
+    await message.answer("Бот готов к работе. Используйте меню настроек для выбора модели.", reply_markup=get_settings_kb(await get_model(message.from_user.id)))
 
-def get_all_users() -> list:
-    with sqlite3.connect(DB_FILE) as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT user_id FROM allowed_users")
-        return [row[0] for row in cursor.fetchall()]
+@dp.callback_query(F.data.startswith("model_"))
+async def change_model(callback: types.CallbackQuery):
+    model = callback.data.split("_")[1]
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("INSERT OR REPLACE INTO user_settings (user_id, model) VALUES (?, ?)", (callback.from_user.id, model))
+        await db.commit()
+    await callback.answer(f"Выбрана модель: {model}")
+    await callback.message.edit_reply_markup(reply_markup=get_settings_kb(model))
 
-def is_user_allowed(user_id: int) -> bool:
-    with sqlite3.connect(DB_FILE) as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT 1 FROM allowed_users WHERE user_id = ?", (user_id,))
-        return cursor.fetchone() is not None
-
-
-# 🛠️ MIDDLEWARE
-class SecurityMiddleware(BaseMiddleware):
-    def __init__(self):
-        super().__init__()
-        self.user_cooldowns: Dict[int, float] = {}
-
-    async def __call__(
-        self,
-        handler: Callable[[types.Message, Dict[str, Any]], Awaitable[Any]],
-        event: types.Message,
-        data: Dict[str, Any]
-    ) -> Any:
-        if not isinstance(event, types.Message) or not event.from_user:
-            return await handler(event, data)
-
-        user_id = event.from_user.id
-        current_time = asyncio.get_event_loop().time()
-
-        if not is_user_allowed(user_id):
-            if event.text and not event.text.startswith('/'):
-                await event.answer("⛔ Доступ ограничен. Вы не внесены в белый список.")
-            return
-
-        last_request_time = self.user_cooldowns.get(user_id, 0.0)
-        if current_time - last_request_time < THROTTLING_DELAY:
-            if current_time - last_request_time > 1.0:
-                await event.answer(f"⚠️ Пауза! Подождите {THROTTLING_DELAY} сек.")
-            return
-
-        self.user_cooldowns[user_id] = current_time
-        return await handler(event, data)
-
-dp.message.middleware(SecurityMiddleware())
-
-
-# 👑 АДМИН-КОМАНДЫ
-@dp.message(Command("add"))
-async def cmd_add_user(message: types.Message):
-    if message.from_user.id != ADMIN_ID: return
-    try:
-        target_id = int(message.text.split()[1])
-        if add_user_to_db(target_id):
-            await message.answer(f"✅ Пользователь `{target_id}` добавлен.")
-        else:
-            await message.answer("ℹ️ Уже в списке.")
-    except (IndexError, ValueError):
-        await message.answer("❌ Формат: `/add ID`")
-
-@dp.message(Command("del"))
-async def cmd_del_user(message: types.Message):
-    if message.from_user.id != ADMIN_ID: return
-    try:
-        target_id = int(message.text.split()[1])
-        if target_id == ADMIN_ID:
-            await message.answer("❌ Нельзя удалить себя.")
-            return
-        if remove_user_from_db(target_id):
-            await message.answer(f"🗑️ Пользователь `{target_id}` удален.")
-            # Стираем его контекст из памяти при удалении
-            USER_HISTORY.pop(target_id, None)
-        else:
-            await message.answer("ℹ️ Не найден.")
-    except (IndexError, ValueError):
-        await message.answer("❌ Формат: `/del ID`")
-
-@dp.message(Command("list"))
-async def cmd_list_users(message: types.Message):
-    if message.from_user.id != ADMIN_ID: return
-    users = get_all_users()
-    users_str = "\n".join([f"• `{u}`" + (" (Админ)" if u == ADMIN_ID else "") for u in users])
-    await message.answer(f"📋 **Белый список:**\n\n{users_str}", parse_mode="Markdown")
-
-
-# 🧹 КОМАНДА ДЛЯ СБРОСА КОНТЕКСТА
-@dp.message(Command("clear"))
-async def cmd_clear_context(message: types.Message):
-    user_id = message.from_user.id
-    if user_id in USER_HISTORY:
-        USER_HISTORY[user_id] = []
-        await message.answer("🧹 История нашего диалога очищена. Бот всё забыл!")
-    else:
-        await message.answer("ℹ️ Ваша история диалога и так пуста.")
-
-
-# 🤖 РАБОТА С ИИ И КОНТЕКСТОМ
-def ask_gemini_with_context(user_id: int, prompt: str) -> str:
-    try:
-        # Инициализируем историю для пользователя, если её нет
-        if user_id not in USER_HISTORY:
-            USER_HISTORY[user_id] = []
-            
-        # Используем встроенный механизм чата из актуальной библиотеки google-genai
-        chat = ai_client.chats.create(
-            model=MODEL_NAME,
-            history=USER_HISTORY[user_id]
-        )
-        
-        # Отправляем сообщение ИИ
-        response = chat.send_message(prompt)
-        
-        # Обновляем историю в нашем словаре
-        USER_HISTORY[user_id] = chat.get_history()
-        
-        # Обрезаем историю, если она превышает лимит (убираем самые старые сообщения)
-        # Умножаем на 2, так как одна реплика состоит из 'user' и 'model'
-        if len(USER_HISTORY[user_id]) > MAX_HISTORY_LEN * 2:
-            USER_HISTORY[user_id] = USER_HISTORY[user_id][-(MAX_HISTORY_LEN * 2):]
-            
-        return response.text
-    except Exception as e:
-        return f"Ошибка при обращении к AI: {e}"
-
-
-@dp.message(CommandStart())
-async def cmd_start(message: types.Message):
-    await message.answer(
-        "Привет! Вы авторизованы.\n"
-        "Я помню контекст нашей беседы. Если вы захотите начать тему с чистого листа, введите команду /clear"
-    )
+@dp.callback_query(F.data == "reset")
+async def reset_history(callback: types.CallbackQuery):
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("DELETE FROM history WHERE user_id = ?", (callback.from_user.id,))
+        await db.commit()
+    await callback.answer("История очищена")
 
 @dp.message()
-async def handle_message(message: types.Message):
-    if not message.text or message.text.startswith('/'):
-        return
-    
-    await bot.send_chat_action(chat_id=message.chat.id, action="typing")
-    
-    # Передаем user_id, чтобы Gemini знал, чью историю подгружать
-    reply_text = await asyncio.to_thread(ask_gemini_with_context, message.from_user.id, message.text)
-    await message.answer(reply_text)
+async def chat_handler(message: Message):
+    if not await is_allowed(message.from_user.id):
+        return await message.answer("У вас нет доступа.")
 
+    user_id = message.from_user.id
+    model = await get_model(user_id)
+    
+    async with aiosqlite.connect(DB_NAME) as db:
+        # Получаем контекст
+        async with db.execute("SELECT role, content FROM history WHERE user_id = ?", (user_id,)) as cursor:
+            messages = [{"role": r[0], "content": r[1]} for r in await cursor.fetchall()]
+        
+        if not messages:
+            messages = [{"role": "system", "content": "Ты полезный ассистент."}]
+        
+        messages.append({"role": "user", "content": message.text})
+
+        # Запрос
+        response = await client.chat.completions.create(model=model, messages=messages)
+        answer = response.choices[0].message.content
+        
+        # Сохранение
+        await db.execute("INSERT INTO history (user_id, role, content) VALUES (?, ?, ?)", (user_id, "user", message.text))
+        await db.execute("INSERT INTO history (user_id, role, content) VALUES (?, ?, ?)", (user_id, "assistant", answer))
+        await db.commit()
+
+    await message.answer(answer, reply_markup=get_settings_kb(model))
 
 async def main():
-    init_db()
-    print("Бот запущен с контекстом и БД...")
+    await init_db()
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
