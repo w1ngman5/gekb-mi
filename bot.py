@@ -354,12 +354,26 @@ async def handle_universal_input(message: Message, bot: Bot):
         await save_chat_message(user_id, "user", prompt_text)
         await save_chat_message(user_id, "model", collected_text)
 
-    except Exception as e:
-        logger.error(f"Сетевая ошибка Gemini API при запросе пользователя {user_id}: {e}", exc_info=True)
+    except genai.errors.APIError as api_err:
+        # Логируем специфичную ошибку Google API с полной трассировкой стека
+        logger.error(
+            f"Отказ API Gemini для пользователя {user_id}. "
+            f"Код ошибки: {api_err.code}, Сообщение: {api_err.message}", 
+            exc_info=True
+        )
         await bot.edit_message_text(
             chat_id=message.chat.id,
             message_id=status_msg.message_id,
-            text="❌ Ошибка связи с сервером ИИ. Попробуйте позже.",
+            text=f"❌ Ошибка Google API ({api_err.code}): {api_err.message}",
+        )
+
+    except Exception as e:
+        # Логируем любые другие непредвиденные системные ошибки (сеть, база данных и т.д.)
+        logger.error(f"Непредвиденная ошибка при обработке запроса пользователя {user_id}: {e}", exc_info=True)
+        await bot.edit_message_text(
+            chat_id=message.chat.id,
+            message_id=status_msg.message_id,
+            text=f"❌ Системная ошибка: {str(e)}",
         )
 
 
