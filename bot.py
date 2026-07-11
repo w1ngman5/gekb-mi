@@ -8,6 +8,7 @@ from aiogram.filters import Command
 import aiosqlite
 from google import genai
 from google.genai import types
+from datetime import datetime
 
 # --- НАСТРОЙКА ЛОГИРОВАНИЯ ---
 logging.basicConfig(
@@ -57,6 +58,7 @@ async def init_db():
                 timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        await db.execute("CREATE TABLE IF NOT EXISTS daily_quota_tracker (date_str TEXT PRIMARY KEY, request_count INTEGER DEFAULT 0)")
         await db.execute("INSERT OR IGNORE INTO whitelist (user_id) VALUES (?)", (int(ADMIN_ID),))
         await db.commit()
 
@@ -84,6 +86,12 @@ async def clear_user_context(user_id: int):
         await db.execute("DELETE FROM chat_history WHERE user_id = ?", (user_id,))
         await db.commit()
 
+async def get_current_quota_count() -> int:
+    today_str = datetime.utcnow().strftime("%Y-%m-%d")
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT request_count FROM daily_quota_tracker WHERE date_str = ?", (today_str,)) as cursor:
+            res = await cursor.fetchone()
+            return res[0] if res else 0
 
 async def save_chat_message(user_id: int, role: str, text: str):
     """Сохранение сообщения и автоматическая очистка старого контекста при превышении лимита"""
@@ -205,6 +213,17 @@ async def cmd_remove_user(message: Message):
     username_str = f" (@{target_user.username})" if target_user.username else ""
     await message.answer(f"🗑️ Пользователь {target_user.full_name}{username_str} удален из whitelist. Его контекст очищен.")
 
+@dp.message(Command("quota"))
+async def cmd_view_quota(message: Message):
+    current_used = await get_current_quota_count()
+    remaining = max(0, 1500 - current_used)
+    await message.answer(
+        f"📊 Статистика квот Gemini (за сегодня):\n\n"
+        f"Использовано: {current_used} / 1500 запросов.\n"
+        f"Осталось: {remaining} запросов.\n"
+        f"Модель: gemini-3.1-flash-lite"
+    )
+
 
 # --- ОБРАБОТЧИКИ УПРАВЛЕНИЯ КОНТЕКСТОМ ---
 @dp.message(F.text == "🧹 Очистить контекст")
@@ -305,7 +324,7 @@ async def handle_universal_input(message: Message, bot: Bot):
 
     try:
         response_stream = await ai_client.aio.models.generate_content_stream(
-            model="gemini-2.0-flash",
+            model="gemini-3.1-flash-lite",
             contents=full_request_contents
         )
 
