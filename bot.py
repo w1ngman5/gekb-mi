@@ -24,7 +24,7 @@ GEMINI_KEY = os.getenv("GEMINI_API_KEY")
 
 DB_PATH = "bot_database.db"
 MAX_CONTEXT_LEN = 50  # Лимит истории сообщений
-DAILY_LIMIT = 1500     # Официальная дневная квота gemini-3.1-flash-lite
+DAILY_LIMIT = 500     # Официальная дневная квота gemini-3.1-flash-lite
 
 if not BOT_TOKEN or not ADMIN_ID or not GEMINI_KEY:
     logger.critical("Критические переменные окружения (TELEGRAM_BOT_TOKEN, ADMIN_ID или GEMINI_API_KEY) не заданы на хостинге!")
@@ -192,12 +192,12 @@ async def cmd_add_user(message: Message):
     if str(message.from_user.id) != str(ADMIN_ID):
         return
     if not message.reply_to_message or not message.reply_to_message.from_user:
-        await message.answer("❌ Сделайте ответ (reply) на сообщение пользователя, чтобы добавить его.")
+        await message.answer("Сделайте ответ (reply) на сообщение пользователя, чтобы добавить его.")
         return
     target_user = message.reply_to_message.from_user
     await add_to_whitelist(target_user.id)
     username_str = f" (@{target_user.username})" if target_user.username else ""
-    await message.answer(f"✅ Пользователь {target_user.full_name}{username_str} добавлен в whitelist.")
+    await message.answer(f"Пользователь {target_user.full_name}{username_str} добавлен в whitelist.")
 
 
 @dp.message(Command("remove"))
@@ -205,30 +205,28 @@ async def cmd_remove_user(message: Message):
     if str(message.from_user.id) != str(ADMIN_ID):
         return
     if not message.reply_to_message or not message.reply_to_message.from_user:
-        await message.answer("❌ Сделайте ответ (reply) на сообщение пользователя, чтобы удалить его.")
+        await message.answer("Сделайте ответ (reply) на сообщение пользователя, чтобы удалить его.")
         return
     target_user = message.reply_to_message.from_user
     if str(target_user.id) == str(ADMIN_ID):
-        await message.answer("❌ Нельзя удалить главного администратора.")
+        await message.answer("Нельзя удалить главного администратора.")
         return
     await remove_from_whitelist(target_user.id)
     await clear_user_context(target_user.id)
     username_str = f" (@{target_user.username})" if target_user.username else ""
-    await message.answer(f"🗑️ Пользователь {target_user.full_name}{username_str} удален из whitelist.")
+    await message.answer(f"Пользователь {target_user.full_name}{username_str} удален из whitelist.")
 
 
 # --- ПРОСМОТР КВОТЫ И УПРАВЛЕНИЕ КОНТЕКСТОМ ---
 @dp.message(Command("quota"))
 async def cmd_view_quota(message: Message):
-    """Выводит лог текущих потраченных лимитов за день"""
     current_used = await get_current_quota_count()
     remaining = max(0, DAILY_LIMIT - current_used)
     await message.answer(
-        f"📊 *Статистика квот Gemini (за сегодня):*\n\n"
-        f"Использовано: `{current_used}` / `{DAILY_LIMIT}` запросов.\n"
-        f"Осталось: `{remaining}` запросов.\n"
-        f"Модель: `gemini-3.1-flash-lite`",
-        parse_mode="Markdown"
+        f"Статистика квот Gemini (за сегодня):\n\n"
+        f"Использовано: {current_used} / {DAILY_LIMIT} запросов.\n"
+        f"Осталось: {remaining} запросов.\n"
+        f"Модель: gemini-3.1-flash-lite"
     )
 
 
@@ -236,7 +234,7 @@ async def cmd_view_quota(message: Message):
 @dp.message(Command("clear"))
 async def handle_clear_context(message: Message):
     await clear_user_context(message.from_user.id)
-    await message.answer("🧹 История вашей беседы с ИИ полностью очищена!", reply_markup=get_main_keyboard())
+    await message.answer("История вашей беседы с ИИ полностью очищена!", reply_markup=get_main_keyboard())
 
 
 @dp.message(Command("start"))
@@ -325,7 +323,6 @@ async def handle_universal_input(message: Message, bot: Bot):
     chunk_counter = 0
 
     try:
-        # 1. Проверяем жесткое ограничение
         current_used = await get_current_quota_count()
         if current_used >= DAILY_LIMIT:
             logger.warning(f"Предотвращен запрос от {user_id}: Дневной лимит в {DAILY_LIMIT} запросов исчерпан.")
@@ -335,13 +332,11 @@ async def handle_universal_input(message: Message, bot: Bot):
             )
             return
 
-        # 2. Мягкое ограничение — лимит подходит к концу (осталось менее 50 запросов)
         quota_warning_text = ""
         if DAILY_LIMIT - current_used <= 50:
             remaining_quota = DAILY_LIMIT - current_used
-            quota_warning_text = f"⚠️ *Внимание:* Дневная квота бота почти исчерпана. Осталось запросов: `{remaining_quota}`.\n\n"
+            quota_warning_text = f"⚠️ Внимание: Дневная квота бота почти исчерпана. Осталось запросов: {remaining_quota}.\n\n"
 
-        # Потоковый вызов API
         response_stream = await ai_client.aio.models.generate_content_stream(
             model="gemini-3.1-flash-lite",
             contents=full_request_contents
@@ -371,7 +366,6 @@ async def handle_universal_input(message: Message, bot: Bot):
                 parse_mode="Markdown"
             )
 
-        # Успешный запрос: инкрементируем квоту и выводим лог
         total_requests_today = await check_and_increment_quota()
         logger.info(f"Успешный ответ. Запросов за сегодня: {total_requests_today}/{DAILY_LIMIT}")
 
