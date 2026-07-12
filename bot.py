@@ -42,10 +42,18 @@ dp = Dispatcher()
 
 # 2. Настройка прокси для Google Gemini API (google-genai)
 if PROXY_URL:
-    # Создаем HTTP-клиент httpx с поддержкой прокси
-    http_client = httpx.Client(proxy=PROXY_URL)
-    # Передаем его в genai.Client через именованный аргумент http_client
-    ai_client = genai.Client(http_client=http_client)
+    # Конфигурируем прокси через HTTP-транспорты httpx
+    # Это применит прокси как для синхронных, так и для асинхронных вызовов SDK
+    ai_client = genai.Client(
+        http_options=types.HttpOptions(
+            client_args={
+                "transport": httpx.HTTPTransport(proxy=PROXY_URL),
+            },
+            async_client_args={
+                "transport": httpx.AsyncHTTPTransport(proxy=PROXY_URL),
+            },
+        )
+    )
 else:
     ai_client = genai.Client()
 
