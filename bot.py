@@ -359,12 +359,22 @@ async def handle_universal_input(message: Message, bot: Bot):
 
         if collected_text.strip() != last_ui_text:
             final_response = f"{quota_warning_text}{collected_text}"
-            await bot.edit_message_text(
-                chat_id=message.chat.id,
-                message_id=status_msg.message_id,
-                text=final_response,
-                parse_mode="Markdown"
-            )
+            try:
+                # Первая попытка: отправляем красивый текст с Markdown разметкой
+                await bot.edit_message_text(
+                    chat_id=message.chat.id,
+                    message_id=status_msg.message_id,
+                    text=final_response,
+                    parse_mode="Markdown"
+                )
+            except Exception as md_err:
+                # Если в тексте ИИ ломаная разметка — отправляем без parse_mode как обычный текст
+                logger.warning(f"Ошибка парсинга Markdown для юзера {user_id}, отправляю plain text: {md_err}")
+                await bot.edit_message_text(
+                    chat_id=message.chat.id,
+                    message_id=status_msg.message_id,
+                    text=final_response
+                )
 
         total_requests_today = await check_and_increment_quota()
         logger.info(f"Успешный ответ. Запросов за сегодня: {total_requests_today}/{DAILY_LIMIT}")
