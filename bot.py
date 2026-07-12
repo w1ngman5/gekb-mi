@@ -1,68 +1,47 @@
 import asyncio
 import logging
 import os
-import httpx
-
+from datetime import datetime
 from typing import Any, Awaitable, Callable, Dict
 from aiogram import Bot, Dispatcher, F, BaseMiddleware
 from aiogram.types import Message, TelegramObject, ReplyKeyboardMarkup, KeyboardButton
 from aiogram.filters import Command
 import aiosqlite
-from aiogram.client.session.aiohttp import AiohttpSession 
 from google import genai
 from google.genai import types
-from datetime import datetime
 
-# --- НАСТРОЙКА ЛОГИРОВАНИЯ ---
+# --- НАСТРОЙКА ЛОГИРОВАНИЯ НА СЕРВЕРЕ ---
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(name)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
 
-# --- НАСТРОЙКА И ИНИЦИАЛИЗАЦИЯ ИЗ ENV ХОСТИНГА ---
+# --- ЧТЕНИЕ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ ИЗ ПАНЕЛИ ХОСТИНГА ---
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 ADMIN_ID = os.getenv("ADMIN_ID")
+GEMINI_KEY = os.getenv("GEMINI_API_KEY")
+
 DB_PATH = "bot_database.db"
-MAX_CONTEXT_LEN = 50  # Лимит контекста (последние 50 сообщений)
-PROXY_URL = os.getenv("HTTP_PROXY")
+MAX_CONTEXT_LEN = 50  # Лимит истории сообщений
+DAILY_LIMIT = 1500     # Официальная дневная квота gemini-3.1-flash-lite
 
-if not BOT_TOKEN or not ADMIN_ID:
-    logger.critical("Критические переменные окружения (TELEGRAM_BOT_TOKEN или ADMIN_ID) не заданы!")
-    raise ValueError("Критические переменные окружения не заданы!")
+if not BOT_TOKEN or not ADMIN_ID or not GEMINI_KEY:
+    logger.critical("Критические переменные окружения (TELEGRAM_BOT_TOKEN, ADMIN_ID или GEMINI_API_KEY) не заданы на хостинге!")
+    raise ValueError("Критические переменные окружения не заданы в панели хостинга.")
 
-# 1. Настройка прокси для Telegram (aiogram)
-if PROXY_URL:
-    session = AiohttpSession(proxy=PROXY_URL)
-    bot = Bot(token=BOT_TOKEN, session=session)
-else:
-    bot = Bot(token=BOT_TOKEN)
-
+# БОЕВАЯ ИНИЦИАЛИЗАЦИЯ: Чистый запуск. Прокси автоматически подтянутся из ENV хостинга
+bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
+ai_client = genai.Client(api_key=GEMINI_KEY)
 
-# 2. Настройка прокси для Google Gemini API (google-genai)
-if PROXY_URL:
-    # Конфигурируем прокси через HTTP-транспорты httpx
-    # Это применит прокси как для синхронных, так и для асинхронных вызовов SDK
-    ai_client = genai.Client(
-        http_options=types.HttpOptions(
-            client_args={
-                "transport": httpx.HTTPTransport(proxy=PROXY_URL),
-            },
-            async_client_args={
-                "transport": httpx.AsyncHTTPTransport(proxy=PROXY_URL),
-            },
-        )
-    )
-else:
-    ai_client = genai.Client()
 
 # --- REPLY КЛАВИАТУРА ---
 def get_main_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[[KeyboardButton(text="🧹 Очистить контекст")]],
         resize_keyboard=True,
-        input_field_placeholder="Отправьте text или любой файл..."
+        input_field_placeholder="Отправьте текст или любой файл..."
     )
 
 
@@ -83,7 +62,12 @@ async def init_db():
                 timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
             )
         """)
-        await db.execute("CREATE TABLE IF NOT EXISTS daily_quota_tracker (date_str TEXT PRIMARY KEY, request_count INTEGER DEFAULT 0)")
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS daily_quota_tracker (
+                date_str TEXT PRIMARY KEY,
+                request_count INTEGER DEFAULT 0
+            )
+        """)
         await db.execute("INSERT OR IGNORE INTO whitelist (user_id) VALUES (?)", (int(ADMIN_ID),))
         await db.commit()
 
@@ -91,7 +75,8 @@ async def init_db():
 async def is_user_allowed(user_id: int) -> bool:
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute("SELECT 1 FROM whitelist WHERE user_id = ?", (user_id,)) as cursor:
-            return await cursor.fetchone() is not None
+            row = await cursor.fetchone()
+            return row is not None
 
 
 async def add_to_whitelist(user_id: int):
@@ -111,13 +96,12 @@ async def clear_user_context(user_id: int):
         await db.execute("DELETE FROM chat_history WHERE user_id = ?", (user_id,))
         await db.commit()
 
+
+# --- АВТОНОМНАЯ СИСТЕМА УЧЕТА КВОТ НА ПРОДЕ ---
 async def check_and_increment_quota() -> int:
-    """Увеличивает счетчик запросов за текущий день и возвращает его значение"""
     today_str = datetime.utcnow().strftime("%Y-%m-%d")
     async with aiosqlite.connect(DB_PATH) as db:
-        # Создаем запись на сегодня, если ее нет
         await db.execute("INSERT OR IGNORE INTO daily_quota_tracker (date_str, request_count) VALUES (?, 0)", (today_str,))
-        # Увеличиваем счетчик на 1
         await db.execute("UPDATE daily_quota_tracker SET request_count = request_count + 1 WHERE date_str = ?", (today_str,))
         await db.commit()
         
@@ -127,19 +111,19 @@ async def check_and_increment_quota() -> int:
 
 
 async def get_current_quota_count() -> int:
-    """Возвращает текущее количество потраченных запросов за сегодня"""
     today_str = datetime.utcnow().strftime("%Y-%m-%d")
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute("SELECT request_count FROM daily_quota_tracker WHERE date_str = ?", (today_str,)) as cursor:
             res = await cursor.fetchone()
             return res[0] if res else 0
 
+
 async def save_chat_message(user_id: int, role: str, text: str):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("INSERT INTO chat_history (user_id, role, text) VALUES (?, ?, ?)", (user_id, role, text))
         async with db.execute("SELECT COUNT(*) FROM chat_history WHERE user_id = ?", (user_id,)) as cursor:
             res = await cursor.fetchone()
-            count = res[0] if res else 0  # <--- Проверьте, чтобы здесь было res[0]
+            count = res[0] if res else 0
 
         if count > MAX_CONTEXT_LEN:
             await db.execute("""
@@ -207,14 +191,11 @@ dp.message.middleware(AccessAndThrottlingMiddleware())
 async def cmd_add_user(message: Message):
     if str(message.from_user.id) != str(ADMIN_ID):
         return
-
     if not message.reply_to_message or not message.reply_to_message.from_user:
         await message.answer("❌ Сделайте ответ (reply) на сообщение пользователя, чтобы добавить его.")
         return
-
     target_user = message.reply_to_message.from_user
     await add_to_whitelist(target_user.id)
-    
     username_str = f" (@{target_user.username})" if target_user.username else ""
     await message.answer(f"✅ Пользователь {target_user.full_name}{username_str} добавлен в whitelist.")
 
@@ -223,36 +204,34 @@ async def cmd_add_user(message: Message):
 async def cmd_remove_user(message: Message):
     if str(message.from_user.id) != str(ADMIN_ID):
         return
-
     if not message.reply_to_message or not message.reply_to_message.from_user:
         await message.answer("❌ Сделайте ответ (reply) на сообщение пользователя, чтобы удалить его.")
         return
-
     target_user = message.reply_to_message.from_user
-    
     if str(target_user.id) == str(ADMIN_ID):
-        await message.answer("❌ Нельзя удалить из вайтлиста главного администратора.")
+        await message.answer("❌ Нельзя удалить главного администратора.")
         return
-
     await remove_from_whitelist(target_user.id)
     await clear_user_context(target_user.id)
-    
     username_str = f" (@{target_user.username})" if target_user.username else ""
-    await message.answer(f"🗑️ Пользователь {target_user.full_name}{username_str} удален из whitelist. Его контекст очищен.")
+    await message.answer(f"🗑️ Пользователь {target_user.full_name}{username_str} удален из whitelist.")
 
+
+# --- ПРОСМОТР КВОТЫ И УПРАВЛЕНИЕ КОНТЕКСТОМ ---
 @dp.message(Command("quota"))
 async def cmd_view_quota(message: Message):
+    """Выводит лог текущих потраченных лимитов за день"""
     current_used = await get_current_quota_count()
-    remaining = max(0, 1500 - current_used)
+    remaining = max(0, DAILY_LIMIT - current_used)
     await message.answer(
-        f"📊 Статистика квот Gemini (за сегодня):\n\n"
-        f"Использовано: {current_used} / 1500 запросов.\n"
-        f"Осталось: {remaining} запросов.\n"
-        f"Модель: gemini-3.1-flash-lite"
+        f"📊 *Статистика квот Gemini (за сегодня):*\n\n"
+        f"Использовано: `{current_used}` / `{DAILY_LIMIT}` запросов.\n"
+        f"Осталось: `{remaining}` запросов.\n"
+        f"Модель: `gemini-3.1-flash-lite`",
+        parse_mode="Markdown"
     )
 
 
-# --- ОБРАБОТЧИКИ УПРАВЛЕНИЯ КОНТЕКСТОМ ---
 @dp.message(F.text == "🧹 Очистить контекст")
 @dp.message(Command("clear"))
 async def handle_clear_context(message: Message):
@@ -286,24 +265,20 @@ def get_file_id_from_message(message: Message) -> str:
     return ""
 
 
-# --- ФИЛЬТР УПОМИНАНИЙ И ОТВЕТОВ В ГРУППАХ ---
 async def should_respond(message: Message, bot_info) -> bool:
     if message.chat.type == "private":
         return True
-        
     if message.text and f"@{bot_info.username}" in message.text:
         return True
     if message.caption and f"@{bot_info.username}" in message.caption:
         return True
-        
     if message.reply_to_message and message.reply_to_message.from_user:
         if message.reply_to_message.from_user.id == bot_info.id:
             return True
-            
     return False
 
 
-# --- ОСНОВНОЙ ХЕНДЛЕР: СТРИМИНГ С КОНТЕКСТОМ И ФАЙЛАМИ ---
+# --- ОСНОВНОЙ ХЕНДЛЕР: СТРИМИНГ, КОНТРОЛЬ КВОТЫ И ЛОГИ ОШИБОК ---
 @dp.message()
 async def handle_universal_input(message: Message, bot: Bot):
     user_id = message.from_user.id
@@ -333,7 +308,7 @@ async def handle_universal_input(message: Message, bot: Bot):
             contents_payload.append(file_part)
         except Exception as file_err:
             logger.error(f"Сетевая ошибка при скачивании файла из Telegram для пользователя {user_id}: {file_err}", exc_info=True)
-            await bot.edit_message_text(f"❌ Ошибка загрузки медиафайла мессенджером.", chat_id=message.chat.id, message_id=status_msg.message_id)
+            await bot.edit_message_text("❌ Ошибка загрузки медиафайла мессенджером.", chat_id=message.chat.id, message_id=status_msg.message_id)
             return
 
     contents_payload.append(types.Part.from_text(text=prompt_text))
@@ -350,6 +325,23 @@ async def handle_universal_input(message: Message, bot: Bot):
     chunk_counter = 0
 
     try:
+        # 1. Проверяем жесткое ограничение
+        current_used = await get_current_quota_count()
+        if current_used >= DAILY_LIMIT:
+            logger.warning(f"Предотвращен запрос от {user_id}: Дневной лимит в {DAILY_LIMIT} запросов исчерпан.")
+            await bot.edit_message_text(
+                "❌ К сожалению, дневной лимит запросов бота к Gemini API полностью исчерпан. Бот возобновит работу завтра.",
+                chat_id=message.chat.id, message_id=status_msg.message_id
+            )
+            return
+
+        # 2. Мягкое ограничение — лимит подходит к концу (осталось менее 50 запросов)
+        quota_warning_text = ""
+        if DAILY_LIMIT - current_used <= 50:
+            remaining_quota = DAILY_LIMIT - current_used
+            quota_warning_text = f"⚠️ *Внимание:* Дневная квота бота почти исчерпана. Осталось запросов: `{remaining_quota}`.\n\n"
+
+        # Потоковый вызов API
         response_stream = await ai_client.aio.models.generate_content_stream(
             model="gemini-3.1-flash-lite",
             contents=full_request_contents
@@ -371,35 +363,31 @@ async def handle_universal_input(message: Message, bot: Bot):
                         await asyncio.sleep(0.1)
 
         if collected_text.strip() != last_ui_text:
+            final_response = f"{quota_warning_text}{collected_text}"
             await bot.edit_message_text(
                 chat_id=message.chat.id,
                 message_id=status_msg.message_id,
-                text=collected_text,
+                text=final_response,
                 parse_mode="Markdown"
             )
+
+        # Успешный запрос: инкрементируем квоту и выводим лог
+        total_requests_today = await check_and_increment_quota()
+        logger.info(f"Успешный ответ. Запросов за сегодня: {total_requests_today}/{DAILY_LIMIT}")
 
         await save_chat_message(user_id, "user", prompt_text)
         await save_chat_message(user_id, "model", collected_text)
 
     except genai.errors.APIError as api_err:
-        # Логируем специфичную ошибку Google API с полной трассировкой стека
-        logger.error(
-            f"Отказ API Gemini для пользователя {user_id}. "
-            f"Код ошибки: {api_err.code}, Сообщение: {api_err.message}", 
-            exc_info=True
-        )
+        logger.error(f"Отказ API Gemini для пользователя {user_id}. Код: {api_err.code}, Месседж: {api_err.message}", exc_info=True)
         await bot.edit_message_text(
-            chat_id=message.chat.id,
-            message_id=status_msg.message_id,
+            chat_id=message.chat.id, message_id=status_msg.message_id,
             text=f"❌ Ошибка Google API ({api_err.code}): {api_err.message}",
         )
-
     except Exception as e:
-        # Логируем любые другие непредвиденные системные ошибки (сеть, база данных и т.д.)
         logger.error(f"Непредвиденная ошибка при обработке запроса пользователя {user_id}: {e}", exc_info=True)
         await bot.edit_message_text(
-            chat_id=message.chat.id,
-            message_id=status_msg.message_id,
+            chat_id=message.chat.id, message_id=status_msg.message_id,
             text=f"❌ Системная ошибка: {str(e)}",
         )
 
