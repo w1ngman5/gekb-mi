@@ -111,7 +111,23 @@ async def clear_user_context(user_id: int):
         await db.execute("DELETE FROM chat_history WHERE user_id = ?", (user_id,))
         await db.commit()
 
+async def check_and_increment_quota() -> int:
+    """Увеличивает счетчик запросов за текущий день и возвращает его значение"""
+    today_str = datetime.utcnow().strftime("%Y-%m-%d")
+    async with aiosqlite.connect(DB_PATH) as db:
+        # Создаем запись на сегодня, если ее нет
+        await db.execute("INSERT OR IGNORE INTO daily_quota_tracker (date_str, request_count) VALUES (?, 0)", (today_str,))
+        # Увеличиваем счетчик на 1
+        await db.execute("UPDATE daily_quota_tracker SET request_count = request_count + 1 WHERE date_str = ?", (today_str,))
+        await db.commit()
+        
+        async with db.execute("SELECT request_count FROM daily_quota_tracker WHERE date_str = ?", (today_str,)) as cursor:
+            res = await cursor.fetchone()
+            return res[0] if res else 0
+
+
 async def get_current_quota_count() -> int:
+    """Возвращает текущее количество потраченных запросов за сегодня"""
     today_str = datetime.utcnow().strftime("%Y-%m-%d")
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute("SELECT request_count FROM daily_quota_tracker WHERE date_str = ?", (today_str,)) as cursor:
@@ -119,34 +135,20 @@ async def get_current_quota_count() -> int:
             return res[0] if res else 0
 
 async def save_chat_message(user_id: int, role: str, text: str):
-    """Сохранение сообщения и автоматическая очистка старого контекста при превышении лимита"""
     async with aiosqlite.connect(DB_PATH) as db:
-        # 1. Записываем новое сообщение
-        await db.execute(
-            "INSERT INTO chat_history (user_id, role, text) VALUES (?, ?, ?)", 
-            (user_id, role, text)
-        )
-        
-        # 2. Проверяем текущее количество сообщений пользователя
-        async with db.execute(
-            "SELECT COUNT(*) FROM chat_history WHERE user_id = ?", 
-            (user_id,)
-        ) as cursor:
+        await db.execute("INSERT INTO chat_history (user_id, role, text) VALUES (?, ?, ?)", (user_id, role, text))
+        async with db.execute("SELECT COUNT(*) FROM chat_history WHERE user_id = ?", (user_id,)) as cursor:
             res = await cursor.fetchone()
-            count = res[0] if res else 0
+            count = res[0] if res else 0  # <--- Проверьте, чтобы здесь было res[0]
 
-        # 3. Если перешагнули лимит — удаляем самое старое сообщение (FIFO)
         if count > MAX_CONTEXT_LEN:
             await db.execute("""
                 DELETE FROM chat_history 
                 WHERE id IN (
-                    SELECT id FROM chat_history 
-                    WHERE user_id = ? 
-                    ORDER BY timestamp ASC 
-                    LIMIT ?
+                    SELECT id FROM chat_history WHERE user_id = ? 
+                    ORDER BY timestamp ASC LIMIT ?
                 )
             """, (user_id, count - MAX_CONTEXT_LEN))
-            
         await db.commit()
 
 
