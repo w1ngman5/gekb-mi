@@ -8,6 +8,7 @@ from aiogram import Bot, Dispatcher, F, BaseMiddleware
 from aiogram.types import Message, TelegramObject, ReplyKeyboardMarkup, KeyboardButton
 from aiogram.filters import Command
 import aiosqlite
+from aiogram.client.session.aiohttp import AiohttpSession 
 from google import genai
 from google.genai import types
 from datetime import datetime
@@ -32,7 +33,7 @@ if not BOT_TOKEN or not ADMIN_ID:
 
 # 1. Настройка прокси для Telegram (aiogram)
 if PROXY_URL:
-    session = AioHttpSession(proxy=PROXY_URL)
+    session = AiohttpSession(proxy=PROXY_URL)
     bot = Bot(token=BOT_TOKEN, session=session)
 else:
     bot = Bot(token=BOT_TOKEN)
