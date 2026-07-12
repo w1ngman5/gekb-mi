@@ -1,6 +1,8 @@
 import asyncio
 import logging
 import os
+import httpx
+
 from typing import Any, Awaitable, Callable, Dict
 from aiogram import Bot, Dispatcher, F, BaseMiddleware
 from aiogram.types import Message, TelegramObject, ReplyKeyboardMarkup, KeyboardButton
@@ -22,15 +24,29 @@ BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 ADMIN_ID = os.getenv("ADMIN_ID")
 DB_PATH = "bot_database.db"
 MAX_CONTEXT_LEN = 50  # Лимит контекста (последние 50 сообщений)
+PROXY_URL = os.getenv("HTTP_PROXY")
 
 if not BOT_TOKEN or not ADMIN_ID:
     logger.critical("Критические переменные окружения (TELEGRAM_BOT_TOKEN или ADMIN_ID) не заданы!")
     raise ValueError("Критические переменные окружения не заданы!")
 
-bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher()
-ai_client = genai.Client()
+# 1. Настройка прокси для Telegram (aiogram)
+if PROXY_URL:
+    session = AiohttpSession(proxy=PROXY_URL)
+    bot = Bot(token=BOT_TOKEN, session=session)
+else:
+    bot = Bot(token=BOT_TOKEN)
 
+dp = Dispatcher()
+
+# 2. Настройка прокси для Google Gemini API (google-genai)
+if PROXY_URL:
+    # Создаем HTTP-клиент httpx с поддержкой прокси
+    http_client = httpx.Client(proxy=PROXY_URL)
+    # Передаем его в genai.Client через именованный аргумент http_client
+    ai_client = genai.Client(http_client=http_client)
+else:
+    ai_client = genai.Client()
 
 # --- REPLY КЛАВИАТУРА ---
 def get_main_keyboard() -> ReplyKeyboardMarkup:
